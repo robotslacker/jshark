@@ -1,0 +1,50 @@
+<!--
+    发布包描述符：dist/jshark-dist_<version>.zip
+
+    面向"拿来就跑"的使用者：把三个可执行 jar（capture/replay/udpforwarder）
+    连同工程说明，按 jshark 惯例收进一个扁平压缩包。
+
+    布局说明：
+      README.md          工程说明
+      LICENSE            许可声明
+      jlib/              Spring Boot 可执行 jar：
+                         jshark-<version>-capture.jar      包捕获工具
+                         jshark-<version>-replay.jar       包重放工具
+                         jshark-<version>-udpforwarder.jar UDP/TCP 转发器
+
+    说明：
+      jshark 为单模块工程，${project.basedir} 即仓库根；三个可执行 jar
+      由 spring-boot-maven-plugin repackage 生成于 target/ 下。
+-->
+<assembly>
+    <id>deployment</id>
+    <formats>
+        <format>zip</format>
+    </formats>
+    <includeBaseDirectory>false</includeBaseDirectory>
+    <baseDirectory>/</baseDirectory>
+
+    <fileSets>
+        <!-- 工程说明与许可声明 -->
+        <fileSet>
+            <directory>${project.basedir}</directory>
+            <outputDirectory>/</outputDirectory>
+            <includes>
+                <include>README.md</include>
+                <include>LICENSE</include>
+            </includes>
+        </fileSet>
+
+        <!-- 可执行 jar：全部放进 jlib/ -->
+        <fileSet>
+            <directory>${project.basedir}/target</directory>
+            <outputDirectory>jlib</outputDirectory>
+            <includes>
+                <include>jshark-${project.version}-capture.jar</include>
+                <include>jshark-${project.version}-replay.jar</include>
+                <include>jshark-${project.version}-udpforwarder.jar</include>
+            </includes>
+        </fileSet>
+    </fileSets>
+
+</assembly>

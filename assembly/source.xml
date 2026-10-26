@@ -1,0 +1,66 @@
+<!--
+    源码发行包描述符：dist/jshark-src_<version>.zip
+
+    目标 —— 解开后等于一次浅克隆：只有代码、构建脚本与文档，
+    没有编译产物（target/）、IDE 配置（.idea/）和运行期临时文件。
+    解压后可以立即：
+
+        cd jshark-<version>
+        mvn clean package -Dmaven.test.skip=true
+
+    编译产物会落在解压目录自己的 dist/ 下（含发布包 jshark-dist_<version>.zip）。
+
+    与 deployment.xml 的分工：
+      * deployment.xml —— 面向"拿来就跑"的使用者：三个可执行 jar + README。
+      * source.xml     —— 面向"拿来就改"的开发者：完整的单模块 Maven 工程。
+    两者互不嵌套，平级放在 dist/ 下。
+
+    约束与取舍：
+      1. 仓库根只列白名单（pom.xml/README.md/.gitignore/LICENSE），避免把 .git/.idea 带进去。
+         LICENSE 是发行物的一部分：源码包与发布包都必须带上，否则再分发时缺少许可声明。
+      2. src/** 整体保留，排除 target/**；assembly/** 必须保留，
+         使得解压后 mvn package 仍能重新生成 dist。
+      3. *.iml 是 IntelliJ 本地模块文件，排除。
+-->
+<assembly>
+    <id>source</id>
+    <formats>
+        <format>zip</format>
+    </formats>
+    <includeBaseDirectory>true</includeBaseDirectory>
+    <baseDirectory>jshark-${project.version}</baseDirectory>
+
+    <fileSets>
+        <!-- 仓库根：构建入口、说明与忽略规则（关掉默认排除，否则 .gitignore 会被吃掉） -->
+        <fileSet>
+            <directory>${project.basedir}</directory>
+            <outputDirectory>/</outputDirectory>
+            <useDefaultExcludes>false</useDefaultExcludes>
+            <includes>
+                <include>pom.xml</include>
+                <include>README.md</include>
+                <include>.gitignore</include>
+                <include>LICENSE</include>
+            </includes>
+        </fileSet>
+
+        <!-- 源码与构建描述符：排除编译产物与 IDE 配置 -->
+        <fileSet>
+            <directory>${project.basedir}/src</directory>
+            <outputDirectory>/src</outputDirectory>
+            <excludes>
+                <exclude>target/**</exclude>
+                <exclude>*.iml</exclude>
+                <exclude>.idea/**</exclude>
+            </excludes>
+        </fileSet>
+        <fileSet>
+            <directory>${project.basedir}/assembly</directory>
+            <outputDirectory>/assembly</outputDirectory>
+            <excludes>
+                <exclude>*.iml</exclude>
+                <exclude>.idea/**</exclude>
+            </excludes>
+        </fileSet>
+    </fileSets>
+</assembly>

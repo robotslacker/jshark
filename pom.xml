@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.jshark</groupId>
+    <artifactId>jshark</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>JShark - Java Packet Capture Tool</name>
+    <description>A simplified WireShark-like packet capture tool for Java</description>
+
+    <properties>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <pcap4j.version>1.8.2</pcap4j.version>
+        <slf4j.version>2.0.16</slf4j.version>
+        <logback.version>1.5.32</logback.version>
+        <!--
+            默认排除 @Tag("live") 的用例（需要 Npcap + 管理员权限/特定网卡）。
+            刻意做成可覆盖属性：若在 <configuration> 里写死 excludedGroups=live，
+            命令行就再也无法把它们跑起来（POM 配置优先于 -D 属性），
+            `mvn test -Dgroups=live` 会静默地一个用例都不跑。
+            要跑它们：mvn test -Dgroups=live -DexcludedGroups=
+        -->
+        <excludedGroups>live</excludedGroups>
+    </properties>
+
+    <dependencies>
+        <!-- Packet capture library -->
+        <dependency>
+            <groupId>org.pcap4j</groupId>
+            <artifactId>pcap4j-core</artifactId>
+            <version>${pcap4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.pcap4j</groupId>
+            <artifactId>pcap4j-packetfactory-static</artifactId>
+            <version>${pcap4j.version}</version>
+        </dependency>
+        <!-- JSON对象解析 -->
+        <dependency>
+            <groupId>com.alibaba.fastjson2</groupId>
+            <artifactId>fastjson2</artifactId>
+            <version>2.0.47</version>
+        </dependency>
+        <!-- Logging -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>${logback.version}</version>
+        </dependency>
+        <!-- DuckDB 数据库驱动 -->
+        <dependency>
+            <groupId>org.duckdb</groupId>
+            <artifactId>duckdb_jdbc</artifactId>
+            <version>1.5.6.0</version>
+        </dependency>
+        <!-- NETTY 驱动 -->
+        <dependency>
+            <groupId>io.netty</groupId>
+            <artifactId>netty-all</artifactId>
+            <version>4.1.132.Final</version>
+        </dependency>
+
+        <!-- IP掩码判断，用来在多网卡环境下指定网卡 -->
+        <dependency>
+            <groupId>commons-net</groupId>
+            <artifactId>commons-net</artifactId>
+            <version>3.12.0</version>
+        </dependency>
+
+        <!-- 自动化回归测试。历史包袱：src/test 下所有类都是 main() 夹具，
+             没有 JUnit 依赖、也没有 @Test，导致 `mvn test` 实际一个用例都不跑。
+             现在逐个改造成 JUnit 5。 -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.12.2</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <source>21</source>
+                    <target>21</target>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-install-plugin</artifactId>
+                <version>3.1.3</version>
+            </plugin>
+
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <version>3.5.14</version>
+                <executions>
+                    <!-- First execution: JShark-capture.jar with CliShark as main class -->
+                    <execution>
+                        <id>shark-repackage</id>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                        <configuration>
+                            <classifier>capture</classifier>
+                            <mainClass>com.jshark.CliShark</mainClass>
+                        </configuration>
+                    </execution>
+                    <!-- Second execution: JShark-replay.jar with CliReplay as main class -->
+                    <execution>
+                        <id>replay-repackage</id>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                        <configuration>
+                            <classifier>replay</classifier>
+                            <mainClass>com.jshark.CliReplay</mainClass>
+                        </configuration>
+                    </execution>
+                    <!-- Third execution: udpforwarder.jar with CliForwarder as main class -->
+                    <execution>
+                        <id>forwarder-repackage</id>
+                        <goals>
+                            <goal>repackage</goal>
+                        </goals>
+                        <configuration>
+                            <classifier>udpforwarder</classifier>
+                            <mainClass>com.jshark.CliForwarder</mainClass>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <!--
+                clean 阶段先清空仓库根 dist/，保证每次构建产出的发行物是唯一、无残留的。
+            -->
+            <!--
+                自动化回归测试执行器。
+                - reuseForks=false：这些都是重量级场景测试（占用 UDP 端口、写临时 pcap/duckdb、
+                  跑假时钟驱动分卷），共用一个 JVM 会互相干扰，因此每个测试类独立 JVM。
+                - excludedGroups：见 <properties> 里的 excludedGroups，依赖**运行环境**的用例
+                  默认不跑，否则在普通机器/CI 上必然失败。打了 @Tag("live") 的有三类依赖：
+                    1) 需要 Npcap + 管理员权限（原始帧注入：DbFrameReplayTest、InjectE2ETest）；
+                    2) 需要特定网卡/网段（BridgeTest 要求存在 10.10.10.0/24 接口，否则
+                       直接 "Cannot find network interface for CIDR"）；
+                    3) 其它需要真实收发环境的用例。
+                  单独跑到它们：mvn test -Dgroups=live -DexcludedGroups=
+
+                测试前置（很容易踩）：**默认集合也需要本机安装 Npcap**。
+                留在默认集合里的 EndToEndTest / PcapEndToEndTest / FrameStorageTest / SplitOutputTest 等
+                走的是 pcap4j 的离线读（Pcaps.openDead / openOffline / startCaptureFromFile），
+                仍然要通过 pcap4j 的原生库。没有 Npcap 的机器上它们会**硬失败**而不是跳过。
+                只做纯内存解析的 PacketParserContractTest / ThroughputMeterTest 不受影响。
+
+                时序 SLO 门禁（为什么这里没有相关配置）：EndToEndTest 的 4 项时序断言依赖机器负载，
+                实测在阈值两侧来回跳（P99 抖动 254ms / 又在 200ms 内），做进默认 surefire 门禁
+                只会得到随机红灯。因此门禁刻意做成"默认不阻塞、但一定留痕"：
+                  - 每次运行都写 target/timing-slo/e2e-timing-slo.json，并打印一行纯 ASCII
+                    标记 [JShark][TIMING-SLO] report=... sloFailed=...；
+                  - 消费端是 tools/check-timing-slo.ps1（挂在 **continue-on-error** 的 CI 步骤上），
+                    它把"报告缺失"判为退出码 2 —— 这是唯一能发现"检查被悄悄删掉"的机制；
+                  - 需要硬门禁时显式加 -Djshark.test.strictTiming=true（不要在 POM 里写死，
+                    否则命令行再也覆盖不了，与上面 excludedGroups 是同一个教训）。
+                详见 README「运行测试 / 时序 SLO 门禁」。
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.5.5</version>
+                <configuration>
+                    <reuseForks>false</reuseForks>
+                    <forkCount>1</forkCount>
+                    <excludedGroups>${excludedGroups}</excludedGroups>
+                </configuration>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-clean-plugin</artifactId>
+                <version>3.4.1</version>
+                <configuration>
+                    <filesets>
+                        <fileset>
+                            <directory>${project.basedir}/dist</directory>
+                            <includes>
+                                <include>**/*</include>
+                            </includes>
+                            <followSymlinks>false</followSymlinks>
+                        </fileset>
+                    </filesets>
+                </configuration>
+            </plugin>
+
+            <!--
+                发行物一共两个，平级落在 dist/ 下（clean 插件已把整个 dist 清空）：
+
+                  jshark-dist_<version>.zip  发布包：三个可执行 jar + README
+                  jshark-src_<version>.zip   源码包：完整的单模块 Maven 工程，解开即可编译
+
+                为什么源码包是单独一个描述符而不是往发布包里塞各模块的 -sources.jar：
+                -sources.jar 只是 IDE 挂源码用的编译单元切片，既拼不成可编译的工程
+                （缺根 pom、缺描述符），又让使用者多解一层压缩包。
+                源码包按"浅克隆"的形态组织，解压后 `mvn clean package` 直接可用。
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <version>3.7.1</version>
+                <configuration>
+                    <appendAssemblyId>false</appendAssemblyId>
+                    <outputDirectory>${project.basedir}/dist</outputDirectory>
+                </configuration>
+                <executions>
+                    <!-- 源码包：先打包，便于发布包构建失败时也能拿到源码 -->
+                    <execution>
+                        <id>make-source-assembly</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                        <configuration>
+                            <descriptors>
+                                <descriptor>assembly/source.xml</descriptor>
+                            </descriptors>
+                            <finalName>jshark-src_${project.version}</finalName>
+                            <attach>false</attach>
+                        </configuration>
+                    </execution>
+                    <!-- 发布包 -->
+                    <execution>
+                        <id>make-assembly</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                        <configuration>
+                            <descriptors>
+                                <descriptor>assembly/deployment.xml</descriptor>
+                            </descriptors>
+                            <finalName>jshark-dist_${project.version}</finalName>
+                            <attach>false</attach>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
