@@ -20,7 +20,9 @@
          LICENSE 是发行物的一部分：源码包与发布包都必须带上，否则再分发时缺少许可声明。
       2. src/** 整体保留，排除 target/**；assembly/** 必须保留，
          使得解压后 mvn package 仍能重新生成 dist。
-      3. *.iml 是 IntelliJ 本地模块文件，排除。
+      3. imgs/** 必须保留：README.md 用相对路径引用这三张界面截图
+         （imgs/ui-capture.png 等），缺了它们解压后的 README 图片全是坏链接。
+      4. *.iml 是 IntelliJ 本地模块文件，排除。
 -->
 <assembly>
     <id>source</id>
@@ -57,6 +59,16 @@
         <fileSet>
             <directory>${project.basedir}/assembly</directory>
             <outputDirectory>/assembly</outputDirectory>
+            <excludes>
+                <exclude>*.iml</exclude>
+                <exclude>.idea/**</exclude>
+            </excludes>
+        </fileSet>
+
+        <!-- README 引用的界面截图：放在仓库根的 imgs/，随源码包一起发出去 -->
+        <fileSet>
+            <directory>${project.basedir}/imgs</directory>
+            <outputDirectory>/imgs</outputDirectory>
             <excludes>
                 <exclude>*.iml</exclude>
                 <exclude>.idea/**</exclude>

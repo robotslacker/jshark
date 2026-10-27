@@ -162,6 +162,10 @@ java -jar target/jshark-1.0.0-capture.jar --ip_address=192.168.1.100 \
 java -jar target/jshark-1.0.0-capture.jar --ui
 ```
 
+![JShark Capture 采集窗口](imgs/ui-capture.png)
+
+*图 1：`--ui` 打开的采集窗口（深色主题，尚未开始采集）。*
+
 与重放 UI 同一套视觉（深色主题、Consolas 日志、底部 player 条），但只保留采集必需的元素：
 
 - **Interface**：按网卡 IPv4 选择（Refresh 重新枚举）、Promiscuous / Immediate、Multicast（逗号分隔，可留空）。
@@ -431,6 +435,26 @@ java -jar target/jshark-1.0.0-replay.jar --inspect --pcap=capture.pcap
 
 DB 的 `-capturing` 卷会列出但**绝不打开**，标记为不可回放；分卷模式默认只回放已关闭的卷。
 时间轴为空或只有一个瞬时时间戳时，`durationMs=0`，仍是合法结果。
+
+#### 图形界面（`--ui`）
+
+```bash
+# 打开界面；--db / --pcap / --speed / --replayMode / --start / --end 等参数会预填进界面
+java -jar target/jshark-1.0.0-replay.jar --ui --db=capture.db --speed=2.0
+```
+
+![JShark Replay 回放窗口](imgs/ui-replay.png)
+
+*图 2：打开一个三分卷的数据库、检查完成后尚未开始回放的界面（与采集 UI 同一套深色主题）。*
+
+窗口自上而下分四块：
+
+- **Source / Mode**：数据源类型（Database / PCAP）、路径、回放模式（`frame` / `payload`），以及帧模式下的注入网卡与目的 MAC。
+- **参数区**：`Start` / `End` 绝对时间窗口；可折叠的 `Filters`（源/目的 IP 与端口、IP 协议、应用协议、表达式过滤）；`Target mapping`（源 → 目标地址/端口的重写规则，`*` 表示不改）。参数区高度按内容自适应，不会被裁掉一行。
+- **文件表**：每个分卷一行，`Kind` 取 `Final` / `Capturing` / `Single` / `PCAP`，`Replayable` 与 `Status` 说明该卷能否回放、不能回放的原因（正在写入、文件不可读、只有载荷等）；`First` / `Last` 只在其中连续一段内回放，`All files` 恢复全选。
+- **底部 player**：进度条（运行中可直接拖动 seek，松手才生效）、倍速、`Start` / `Pause` / `Stop`，以及当前时间、总时长、剩余时间与已发字节数。
+
+改数据源路径或回放模式会重新检查数据源，顶部一行随即刷新 `Data range` / `Duration` / `Playback range` 与检查结论；确认无误后再点 `Start`。
 
 #### 重放方式说明（重要）
 
@@ -1188,6 +1212,19 @@ java -jar target/jshark-1.0.0-capture.jar --ip_address=192.168.1.100 --filter="t
 ```bash
 java -jar target/jshark-1.0.0-udpforwarder.jar --ui
 ```
+
+![JShark Forwarder 转发窗口](imgs/ui-forwarder.png)
+
+*图 3：`--ui` 打开的转发窗口（四栏布局，尚未开始转发）。*
+
+窗口按四栏排布，正好对应上面的命令行选项：
+
+- **UDP SOURCE**：本地组播地址与端口（`--udpaddr`）、本地组播网卡（`--udpif`，CIDR 形式），本栏底部是 TCP 监听端口（`--port`，仅 `TCP → UDP` 方向需要）。
+- **FORWARDING**：`UDP → TCP` / `TCP → UDP` 两个方向开关（`--utot` / `--ttou`，默认都开，至少开一个）。
+- **PEERS**：对端 `IP:端口` 列表（`--peer`，可多个）；启动后每行的 `TCP` 与 `Since` 显示各对端连接状态与建链时间。
+- **TRAFFIC / STATUS**：两个方向的累计包数与速率、`Dropped` 计数，以及监听端口、本地 UDP 地址与对端汇总。
+
+底部是 `Start` / `Pause` 与已运行时长，`Endpoints` 一行汇总当前生效的转发端点。
 
 #### 使用示例
 
