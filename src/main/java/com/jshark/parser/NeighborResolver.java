@@ -51,11 +51,18 @@ public class NeighborResolver {
     private static final long ARP_PROBE_TIMEOUT_MS = 800L;
     /** 失败缓存的有效期（毫秒）：期间不再重试同一目标 */
     private static final long FAILURE_TTL_MS = 30_000L;
+    /** 系统邻居表缓存的有效期（毫秒）：避免为每个新目标都启动一次 {@code arp -a} */
+    private static final long NEIGHBOR_TABLE_TTL_MS = 5_000L;
+    /** {@code arp -a} / {@code ip neigh} 的超时（秒）：系统命令卡住时不能拖死重放线程 */
+    private static final long NEIGHBOR_COMMAND_TIMEOUT_SECONDS = 2L;
 
     /** 已解析成功的 IP -> MAC */
     private final Map<String, byte[]> cache = new ConcurrentHashMap<>();
     /** 解析失败的 IP -> 失败时间 */
     private final Map<String, Long> failures = new ConcurrentHashMap<>();
+    /** 系统邻居表快照与刷新时间（只由解析线程写；volatile 允许其它线程安全读取） */
+    private volatile Map<String, byte[]> neighborTable = Map.of();
+    private volatile long neighborTableAtMs;
 
     /** 注入网卡（用于主动 ARP 探测）；为 null 时跳过主动探测 */
     private final PcapNetworkInterface nif;
@@ -187,11 +194,15 @@ public class NeighborResolver {
     /**
      * 读取操作系统邻居表。
      *
+     * <p>邻居表有 {@value #NEIGHBOR_TABLE_TTL_MS} 毫秒的缓存：重放线程对每个新目标 IP
+     * 都会查一次，若每次都启动 {@code arp -a}，大量不同目标会把开播拖成“点了 Start 没反应”。
+     * 表本身变化很快，缓存 5 秒足够，且失败结果另有 30 秒负缓存。</p>
+     *
      * @param ip 目标 IP
      * @return MAC；未命中返回 null
      */
     private byte[] lookupNeighborTable(String ip) {
-        // Linux：直接读 /proc
+        // Linux：直接读 /proc（不启动进程，代价很低）
         java.io.File proc = new java.io.File("/proc/net/arp");
         if (proc.isFile()) {
             try (BufferedReader r = new BufferedReader(new java.io.FileReader(proc))) {
@@ -207,34 +218,87 @@ public class NeighborResolver {
             }
         }
 
-        // Windows / 其他：调用 arp -a
-        Map<String, byte[]> table = readArpCommand();
-        return table.get(ip);
+        // Windows / 其他：调用 arp -a（带缓存）
+        return neighborTableSnapshot().get(ip);
+    }
+
+    /** @return 系统邻居表快照；超过 TTL 时重新读取 */
+    private Map<String, byte[]> neighborTableSnapshot() {
+        long now = System.currentTimeMillis();
+        Map<String, byte[]> table = neighborTable;
+        if (!table.isEmpty() && now - neighborTableAtMs <= NEIGHBOR_TABLE_TTL_MS) {
+            return table;
+        }
+        synchronized (this) {
+            now = System.currentTimeMillis();
+            if (neighborTable.isEmpty() || now - neighborTableAtMs > NEIGHBOR_TABLE_TTL_MS) {
+                Map<String, byte[]> refreshed = readArpCommand();
+                // 读失败时不要用空表覆盖旧表：旧数据可能仍然有效。
+                if (!refreshed.isEmpty() || neighborTable.isEmpty()) {
+                    neighborTable = refreshed;
+                }
+                neighborTableAtMs = now;
+            }
+            return neighborTable;
+        }
     }
 
     /** @return {@code arp -a} 解析出的 IP -> MAC 映射（失败返回空表） */
     private Map<String, byte[]> readArpCommand() {
         Map<String, byte[]> table = new LinkedHashMap<>();
+        Process p = null;
         try {
             ProcessBuilder pb = new ProcessBuilder(isWindows() ? new String[]{"arp", "-a"}
                     : new String[]{"ip", "neigh"});
             pb.redirectErrorStream(true);
-            Process p = pb.start();
-            try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
-                String line;
-                while ((line = r.readLine()) != null) {
-                    Matcher m = NEIGHBOR_LINE.matcher(line);
-                    while (m.find()) {
-                        byte[] mac = parseMac(m.group(2));
-                        if (mac != null) {
-                            table.put(m.group(1), mac);
+            p = pb.start();
+
+            // 先把输出读完（命令输出很小），但读取线程与进程都可能卡住：两者都用超时兜住。
+            StringBuilder output = new StringBuilder();
+            Process process = p;
+            Thread reader = new Thread(() -> {
+                try (BufferedReader r = new BufferedReader(
+                        new InputStreamReader(process.getInputStream()))) {
+                    String line;
+                    while ((line = r.readLine()) != null) {
+                        synchronized (output) {
+                            output.append(line).append('\n');
                         }
                     }
+                } catch (Exception e) {
+                    logger.debug("Failed to read OS neighbor table: {}", e.getMessage());
+                }
+            }, "jshark-arp-reader");
+            reader.setDaemon(true);
+            reader.start();
+
+            if (!p.waitFor(NEIGHBOR_COMMAND_TIMEOUT_SECONDS, java.util.concurrent.TimeUnit.SECONDS)) {
+                logger.debug("OS neighbor table command timed out after {}s; killing it",
+                        NEIGHBOR_COMMAND_TIMEOUT_SECONDS);
+                p.destroyForcibly();
+            }
+            reader.join(500);
+            if (reader.isAlive()) {
+                reader.interrupt();
+            }
+
+            String text;
+            synchronized (output) {
+                text = output.toString();
+            }
+            Matcher m = NEIGHBOR_LINE.matcher(text);
+            while (m.find()) {
+                byte[] mac = parseMac(m.group(2));
+                if (mac != null) {
+                    table.put(m.group(1), mac);
                 }
             }
-            p.waitFor();
         } catch (Exception e) {
             logger.debug("Failed to read OS neighbor table: {}", e.getMessage());
+        } finally {
+            if (p != null && p.isAlive()) {
+                p.destroyForcibly();
+            }
         }
         return table;
     }

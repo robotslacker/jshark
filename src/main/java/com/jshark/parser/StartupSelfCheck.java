@@ -130,8 +130,32 @@ public class StartupSelfCheck {
             }
         } catch (Exception e) {
             logger.warn("[JShark] Failed to enumerate network interfaces: {}", e.getMessage());
+        } catch (LinkageError e) {
+            // Npcap/libpcap 未安装或 wpcap.dll 加载失败：这是环境问题，必须给出可操作的提示，
+            // 而不是让 UnsatisfiedLinkError 冒到控制通道并表现为一次无原因的 exit 1。
+            logger.error("[JShark] Npcap/libpcap is unavailable ({}). Install Npcap with WinPcap API "
+                    + "compatibility (or libpcap) and run as Administrator for frame injection.",
+                    e.toString());
         }
         return null;
+    }
+
+    /** @return 本机所有 IPv4（含网卡名），用于“找不到注入网卡”时给出可操作提示 */
+    public static java.util.List<String> listIpv4Addresses() {
+        java.util.List<String> result = new java.util.ArrayList<>();
+        try {
+            for (PcapNetworkInterface nif : Pcaps.findAllDevs()) {
+                for (org.pcap4j.core.PcapAddress a : nif.getAddresses()) {
+                    if (a.getAddress() instanceof java.net.Inet4Address) {
+                        result.add(a.getAddress().getHostAddress()
+                                + " (" + (nif.getDescription() == null ? nif.getName() : nif.getDescription()) + ")");
+                    }
+                }
+            }
+        } catch (Exception | LinkageError ignored) {
+            // 枚举失败时返回空表，调用方只把提示降级为“无法枚举网卡”
+        }
+        return result;
     }
 
     /**
@@ -157,11 +181,21 @@ public class StartupSelfCheck {
         } catch (Exception e) {
             logger.warn("[SelfCheck] Cannot open {} for a capability check: {}", nif.getName(), e.getMessage());
             warnings.add("Failed to open the injection interface: " + e.getMessage());
+        } catch (LinkageError e) {
+            logger.error("[SelfCheck] Npcap/libpcap is unavailable: {}", e.toString());
+            warnings.add("Npcap/libpcap is unavailable: " + e);
         }
 
         if (!ethernet && !"-".equals(dlt)) {
             warnings.add("Injection interface link type is " + dlt + ", not Ethernet. "
                     + "Captured frames are Ethernet frames, so injection would produce malformed output.");
+        }
+        if (isWireless(nif)) {
+            // 自检只能证明“本机能构造并发出帧”，证明不了 AP 会接受它：
+            // Wi-Fi 客户端通常不能伪造源 MAC，AP 会把带原始源 MAC 的注入帧丢掉。
+            warnings.add("This looks like a Wi-Fi adapter. Frame injection over Wi-Fi is unreliable: "
+                    + "the access point usually drops frames whose source MAC is not this client's, even though "
+                    + "the local self-check may pass. Use a wired Ethernet adapter for frame-level replay.");
         }
 
         InjectVerdict verdict = InjectVerdict.UNKNOWN;
@@ -216,6 +250,17 @@ public class StartupSelfCheck {
 
     /** 注入探测结果 */
     private record InjectProbe(InjectVerdict verdict, String detail) {
+    }
+
+    /** @return 网卡描述/设备名是否看起来像 Wi-Fi（用于提示常见的“注入成功但 AP 丢弃”场景） */
+    static boolean isWireless(PcapNetworkInterface nif) {
+        if (nif == null) {
+            return false;
+        }
+        String text = ((nif.getDescription() == null ? "" : nif.getDescription())
+                + " " + (nif.getName() == null ? "" : nif.getName())).toLowerCase(java.util.Locale.ROOT);
+        return text.contains("wi-fi") || text.contains("wifi") || text.contains("wireless")
+                || text.contains("wlan") || text.contains("802.11");
     }
 
     /**
@@ -282,6 +327,8 @@ public class StartupSelfCheck {
             return new InjectProbe(InjectVerdict.SENT_NOT_OBSERVED, sent + " frame(s) injected");
         } catch (PcapNativeException | NotOpenException e) {
             return new InjectProbe(InjectVerdict.FAILED, e.getMessage());
+        } catch (LinkageError e) {
+            return new InjectProbe(InjectVerdict.FAILED, "Npcap/libpcap unavailable: " + e);
         } catch (Exception e) {
             return new InjectProbe(InjectVerdict.UNKNOWN, e.getMessage());
         }

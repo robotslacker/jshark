@@ -81,7 +81,11 @@ public class RawFrameSender implements Closeable, FrameSender {
                     interfaceName, networkInterface.getDescription());
         } catch (Exception e) {
             throw new PacketCaptureException("Failed to open injection interface " + interfaceName
-                    + ". Frame injection needs Administrator/root privileges and a NIC/driver that supports it.", e);
+                    + ". Frame injection needs Administrator/root privileges and a NIC/driver that supports it. "
+                    + "Detail: " + e.getMessage(), e);
+        } catch (LinkageError e) {
+            throw new PacketCaptureException("Failed to load Npcap/libpcap for frame injection (" + e + "). "
+                    + "Install Npcap with WinPcap API compatibility (or libpcap) and run as Administrator.", e);
         }
     }
 

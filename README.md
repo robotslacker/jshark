@@ -451,7 +451,7 @@ java -jar target/jshark-1.0.0-replay.jar --ui --db=capture.db --speed=2.0
 
 - **Source / Mode**：数据源类型（Database / PCAP）、路径、回放模式（`frame` / `payload`），以及帧模式下的注入网卡与目的 MAC。
 - **参数区**：`Start` / `End` 绝对时间窗口；可折叠的 `Filters`（源/目的 IP 与端口、IP 协议、应用协议、表达式过滤）；`Target mapping`（源 → 目标地址/端口的重写规则，`*` 表示不改）。参数区高度按内容自适应，不会被裁掉一行。
-- **文件表**：每个分卷一行，`Kind` 取 `Final` / `Capturing` / `Single` / `PCAP`，`Replayable` 与 `Status` 说明该卷能否回放、不能回放的原因（正在写入、文件不可读、只有载荷等）；`First` / `Last` 只在其中连续一段内回放，`All files` 恢复全选。
+- **文件表**：每个分卷一行，`Kind` 取 `Final` / `Capturing` / `Single` / `PCAP`，`Replayable` 与 `Status` 说明该卷能否回放、不能回放的原因（正在写入、文件不可读、只有载荷等）；`First` / `Last` 只在其中连续一段内回放，`All files` 恢复全选。回放开始后 `Status` 切换成每个卷的完成度：已经越过的卷显示满格的 `Completed`，当前卷显示百分比，还没轮到的卷保持原状态文本。
 - **底部 player**：进度条（运行中可直接拖动 seek，松手才生效）、倍速、`Start` / `Pause` / `Stop`，以及当前时间、总时长、剩余时间与已发字节数。
 
 改数据源路径或回放模式会重新检查数据源，顶部一行随即刷新 `Data range` / `Duration` / `Playback range` 与检查结论；确认无误后再点 `Start`。
@@ -475,6 +475,9 @@ TCP 更是会被拆成一条全新的连接，重放出来的流量与原始流�
 >
 > `--injectInterface` 在 `frame` 模式下是**必需**的：帧必须从指定网卡发出。
 > 发送需要管理员/root 权限（与抓包相同），且依赖 Npcap/libpcap。
+> 在 `--ui` 里选 `frame` 也一样：请以管理员身份启动界面，并在 **Inject interface (frame)** 中选择
+> Npcap 实际可见的网卡；换网/重连后 IP 会变，Start 前界面会刷新列表并提示重选。
+> 失败原因（找不到网卡、打不开注入句柄、自检失败等）会直接显示在状态栏，完整堆栈在 **Log** 页。
 
 #### 自适应降速（`--speed` 是上限）
 
@@ -1207,6 +1210,20 @@ java -jar target/jshark-1.0.0-capture.jar --ip_address=192.168.1.100 --filter="t
 
 > **方向说明**：`--utot`（UDP→TCP）把本地组播数据发送到远端 peer；`--ttou`（TCP→UDP）接收远端 peer 的数据发到本地组播。两者都默认为 `true`（双向）；至少一个必须为 `true`。`--peer` 始终必填——它是 UDP→TCP 的发送目标、也是 TCP→UDP 的接收来源。
 
+#### 性能与调优
+
+- **I/O 传输**：Linux 上优先使用 Netty native epoll，macOS 上优先 kqueue；不可用时自动回退 NIO（Windows 只能 NIO）。启动日志里的 `[BRIDGE] I/O transport: ...` 会显示实际选择。
+- **报文封装**：UDP→TCP 固定为 datagram 格式——每个 UDP 包带 2 字节长度前缀（开销约 0.14% @1400B），接收端还原成独立 UDP 包，报文边界/长度不变。没有额外开关；接收端会自动识别旧/连续流对端并回退到 8 KiB 字节流。
+- **TCP 批量写**：同一批 UDP read 的 frame 先按 peer 聚合成一个 buffer（最多 32 帧或 64 KiB），在 `channelReadComplete` 时每个 peer 只 `write+flush` 一次。**不跨 read 等待**：一批只有 1 个包时，它仍然在同一次 readComplete 立即写出，延迟与逐包写相同；没有定时器/人为延迟。
+- **事件循环**：默认 **1 个 I/O 线程**，让 UDP 收、peer TCP 写、本地 UDP 发在同一线程内联完成，避免每个包跨线程投递。需要多核时用
+  `-Djshark.forwarder.eventLoops=N`（例如 `N=2`）调大；使用 `--ui` 时子进程不继承父进程的 `-D`，可用
+  `JAVA_TOOL_OPTIONS=-Djshark.forwarder.eventLoops=2`。线程越多，跨线程 handoff 越多，通常只有在多 peer 且单核打满时才值得。
+- **背压**：对端 TCP 写缓冲超过 high watermark（64K/256K）时，UDP→TCP 方向按 UDP 语义丢包并计入 `Dropped`，不会无限堆积内存；TCP→UDP 方向则暂停对应 TCP 连接的读取，把压力通过 TCP 窗口传回远端。
+- **socket 缓冲**：UDP 收/发 8 MiB，TCP 收/发 1 MiB；突发流量下比默认缓冲更耐打。
+- **统计**：热路径计数使用 `LongAdder`，peer channel 使用不可变快照，避免每包迭代 `ConcurrentHashMap`。
+
+> **兼容性说明**：发送端固定发 datagram（带 magic）。接收端会自动识别：magic 匹配则按 frame 还原独立 UDP 包；不匹配则视为旧/连续流对端，按 8 KiB 字节流处理。因此“新客户端 → 新服务端”和“旧/stream 客户端 → 新服务端”都兼容；只有“新客户端 → 旧服务端”不兼容（旧服务端会把 magic 当数据），两端同步升级即可。
+
 #### 图形界面（--ui）
 
 ```bash
@@ -1220,7 +1237,7 @@ java -jar target/jshark-1.0.0-udpforwarder.jar --ui
 窗口按四栏排布，正好对应上面的命令行选项：
 
 - **UDP SOURCE**：本地组播地址与端口（`--udpaddr`）、本地组播网卡（`--udpif`，CIDR 形式），本栏底部是 TCP 监听端口（`--port`，仅 `TCP → UDP` 方向需要）。
-- **FORWARDING**：`UDP → TCP` / `TCP → UDP` 两个方向开关（`--utot` / `--ttou`，默认都开，至少开一个）。
+- **FORWARDING**：`UDP → TCP` / `TCP → UDP` 两个方向开关（`--utot` / `--ttou`，默认都开，至少开一个）。UDP→TCP 固定使用 datagram 封装（接收端自动兼容旧的连续字节流），没有额外模式选项。
 - **PEERS**：对端 `IP:端口` 列表（`--peer`，可多个）；启动后每行的 `TCP` 与 `Since` 显示各对端连接状态与建链时间。
 - **TRAFFIC / STATUS**：两个方向的累计包数与速率、`Dropped` 计数，以及监听端口、本地 UDP 地址与对端汇总。
 

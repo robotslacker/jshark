@@ -1062,8 +1062,19 @@ public class DbReplayTool {
                         check.verdict() == StartupSelfCheck.InjectVerdict.OBSERVED_DESPITE_ERROR,
                         check.detail());
                 if (check.verdict() == StartupSelfCheck.InjectVerdict.FAILED) {
+                    String advice = check.advice();
                     logger.error("[JShark] Injection self-check FAILED on this NIC; frames will not reach the "
-                            + "network. Pick another NIC with --injectInterface, then retry.");
+                            + "network. Pick another NIC with --injectInterface, then retry.{}",
+                            advice == null ? "" : " " + advice);
+                    // 让 UI/控制通道也能看到，而不是只有 stderr：否则用户只看到 “Sent 0” 却不知道原因。
+                    control.addWarning("INJECTION_FAILED",
+                            "Frame injection self-check failed on " + injectionInterface.getName()
+                                    + (check.detail() == null || check.detail().isBlank()
+                                        ? "" : ": " + check.detail())
+                                    + (advice == null ? "" : " — " + advice));
+                }
+                for (String warning : check.warnings()) {
+                    control.addWarning("INJECTION_WARNING", warning);
                 }
             }
 

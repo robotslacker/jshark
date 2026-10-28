@@ -812,7 +812,8 @@ public class CliReplay implements ControlServer.Host {
             PcapNetworkInterface nif = StartupSelfCheck.findInterfaceByIp(injectIp);
             if (nif == null) {
                 throw new IllegalArgumentException(
-                        "No network interface has IP " + injectInterface + "; use --injectInterface=<IP>.");
+                        "No network interface has IP " + injectInterface + ". " + injectInterfaceHint()
+                                + " Use --injectInterface=<IP>.");
             }
             FrameRewriter.MacPolicy macPolicy = FrameRewriter.MacPolicy.parse(dstMac);
             java.util.function.Function<String, byte[]> resolver = null;
@@ -923,7 +924,8 @@ public class CliReplay implements ControlServer.Host {
             injectionNif = StartupSelfCheck.findInterfaceByIp(injectInterface.trim());
             if (injectionNif == null) {
                 throw new IllegalArgumentException(
-                        "No network interface has IP " + injectInterface + "; check the address or use --injectInterface.");
+                        "No network interface has IP " + injectInterface + ". " + injectInterfaceHint()
+                                + " Check the address or use --injectInterface.");
             }
 
             // 启动自检：权限 / DLT / 注入能力（只打印，不阻断；会话级缓存，seek 不再重跑）
@@ -940,6 +942,16 @@ public class CliReplay implements ControlServer.Host {
             if (check != null && check.verdict() == StartupSelfCheck.InjectVerdict.FAILED) {
                 logger.error("[JShark] Injection self-check failed on this NIC; replay would send nothing. "
                         + "Pick a wired Ethernet adapter with --injectInterface, then retry.");
+                String advice = check.advice();
+                control().addWarning("INJECTION_FAILED",
+                        "Frame injection self-check failed on " + injectionNif.getName()
+                                + (check.detail() == null || check.detail().isBlank() ? "" : ": " + check.detail())
+                                + (advice == null ? "" : " — " + advice));
+            }
+            if (check != null) {
+                for (String warning : check.warnings()) {
+                    control().addWarning("INJECTION_WARNING", warning);
+                }
             }
         } else if (injectInterface != null) {
             warnIgnored("[JShark] --injectInterface is ignored in 'payload' replay mode");
@@ -969,6 +981,24 @@ public class CliReplay implements ControlServer.Host {
             currentPcapTool = null;
             removeShutdownHook();
         }
+    }
+
+    /**
+     * 找不到注入网卡时的可操作提示：列出 pcap 实际能看到的 IPv4。
+     *
+     * <p>UI 的网卡下拉来自 Java 的 {@code NetworkInterface}，而帧注入按 pcap/Npcap 的设备列表
+     * 解析 IP；两者可能不一致（例如 Npcap 未安装、网卡被 Npcap 排除、或下拉里的 IP 已过期）。
+     * 空列表通常意味着 Npcap/libpcap 不可用。</p>
+     *
+     * @return 单行提示（以空格结尾），可直接拼在错误信息后
+     */
+    private static String injectInterfaceHint() {
+        java.util.List<String> available = StartupSelfCheck.listIpv4Addresses();
+        if (available.isEmpty()) {
+            return "Npcap/libpcap is unavailable or no IPv4 interface is visible to it; "
+                    + "install Npcap with WinPcap API compatibility and run as Administrator.";
+        }
+        return "Interfaces visible to pcap: " + String.join(", ", available) + ".";
     }
 
     /**

@@ -1106,6 +1106,21 @@ public final class ReplayUi {
         private volatile boolean progressVisible = false;
         /** 是否已向子进程发出 start（READY 握手）。 */
         private boolean replayStartSent;
+        /**
+         * 用户是否按过 Stop。
+         *
+         * <p>用 Stop 结束的会话不叫“失败”：子进程可能在 5 秒看门狗内没退干净而被强制结束，
+         * 退出码会是 1，但那不代表重放逻辑失败。终态文案据此区分 Stopped / Failed。</p>
+         */
+        private volatile boolean stopRequestedByUser;
+        /** 子进程 stderr 里最后一条疑似错误行：进程在发终态前就退出时用它解释 exit code。 */
+        private volatile String lastChildError;
+        /** 终态消息里的失败原因；优先于 stderr 行（后者带 Java 异常类名，给用户看太吵）。 */
+        private volatile String terminalFailureText;
+        /** 15 秒内没等到 READY：看门狗杀掉了子进程。 */
+        private volatile boolean startTimedOut;
+        /** 已经写入日志的 status 告警签名（避免每 250ms 重复刷屏）。 */
+        private final java.util.Set<String> loggedStatusWarnings = new java.util.HashSet<>();
         private Timer replayStartWatchdog;
         /** inspect 结果缓存：键为源身份（路径+文件大小+mtime），时间参数变化时不用重新扫描。 */
         private final Map<String, Inspection> inspectionCache = new HashMap<>();
@@ -1948,6 +1963,64 @@ public final class ReplayUi {
 
         private boolean isFrameMode() {
             return !"payload".equals(modeBox.getSelectedItem());
+        }
+
+        /**
+         * Start 之前的帧模式预检，避免拉起一个注定失败的子进程。
+         *
+         * <p>两个现实问题：</p>
+         * <ol>
+         *   <li>帧模式必须有注入网卡；空着直接 Start 只会让子进程在参数校验处退出（exit 1）。</li>
+         *   <li>网卡列表只在界面启动时枚举过一次。笔记本换网/重连后 IP 会变，下拉里留着旧 IP，
+         *       子进程就会报 “No network interface has IP …”。这里在 Start 前重新枚举一次：
+         *       如果用户之前是从列表里选的条目而现在已不存在，就刷新列表并让用户重选。</li>
+         * </ol>
+         *
+         * @return true 表示可以继续 Start
+         */
+        private boolean preflightFrameStart() {
+            if (!isFrameMode()) {
+                return true;
+            }
+            String ip = injectIp();
+            if (ip.isEmpty()) {
+                JOptionPane.showMessageDialog(this,
+                        "Frame replay requires an injection interface.\n"
+                                + "Pick the NIC whose IP is shown in “Inject interface (frame)”.\n"
+                                + "The NIC must be usable by Npcap and JShark must run as Administrator.",
+                        "JShark Replay", JOptionPane.WARNING_MESSAGE);
+                return false;
+            }
+
+            String previous = injectText();
+            populateInjectInterfaces();
+            boolean wasPickedFromList = previous != null && previous.contains("(");
+            if (wasPickedFromList && !injectCandidateExists(ip)) {
+                if (injectBox.getItemCount() > 0) {
+                    setInjectText(injectBox.getItemAt(0));
+                }
+                log("[ui] injection interface disappeared: " + previous + "; refreshed the interface list");
+                JOptionPane.showMessageDialog(this,
+                        "The selected injection interface is no longer available:\n  " + previous + "\n\n"
+                                + "The list has been refreshed (network changed?). Pick the interface to inject from "
+                                + "and press Start again.",
+                        "JShark Replay", JOptionPane.WARNING_MESSAGE);
+                return false;
+            }
+            // 用户手输的 IP 不要求在 Java 的网卡列表里（可能只是名字/可见性不同），保留原值。
+            setInjectText(previous);
+            return true;
+        }
+
+        /** @return 当前网卡下拉中是否存在以该 IP 开头的候选条目 */
+        private boolean injectCandidateExists(String ip) {
+            for (int i = 0; i < injectBox.getItemCount(); i++) {
+                String item = injectBox.getItemAt(i);
+                if (item != null && item.startsWith(ip + " ")) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         /**
@@ -3357,10 +3430,18 @@ public final class ReplayUi {
                         "JShark Replay", JOptionPane.WARNING_MESSAGE);
                 return;
             }
+            if (!preflightFrameStart()) {
+                return;
+            }
             List<String> args = buildReplayArgs();
             if (args.isEmpty()) {
                 return;
             }
+            stopRequestedByUser = false;
+            lastChildError = null;
+            terminalFailureText = null;
+            startTimedOut = false;
+            loggedStatusWarnings.clear();
             if (playbackFrom == null) {
                 playbackFrom = inspection.dataStart;
             }
@@ -3424,8 +3505,31 @@ public final class ReplayUi {
                             finishSeekLoading();
                             clearProgress();
                             log("[control] " + json.getString("type"));
-                            if (json.getString("error") != null) {
-                                stateLabel.setText("Failed");
+                            Object errorValue = json.get("error");
+                            JSONObject error = errorValue instanceof JSONObject o ? o : null;
+                            String reason = error != null ? error.getString("message")
+                                    : (errorValue instanceof String text ? text : null);
+                            if (reason == null || reason.isBlank()) {
+                                reason = json.getString("message");
+                            }
+                            boolean failed = errorValue != null
+                                    || Boolean.FALSE.equals(json.getBoolean("ok"));
+                            if (!failed) {
+                                return;
+                            }
+                            if (stopRequestedByUser) {
+                                // 用户按了 Stop：即使子进程因 5 秒看门狗被强制结束（exit 1），
+                                // 也不是重放逻辑失败。原因仍然写进日志供排查。
+                                stateLabel.setText("Stopped");
+                                if (reason != null && !reason.isBlank()) {
+                                    log("[control] stopped: " + reason);
+                                }
+                            } else {
+                                terminalFailureText = reason;
+                                stateLabel.setText(reason == null || reason.isBlank()
+                                        ? "Failed" : "Failed: " + oneLine(reason));
+                                log("[control] failed: "
+                                        + (reason == null || reason.isBlank() ? "unknown error" : reason));
                             }
                         });
                     }
@@ -3433,6 +3537,9 @@ public final class ReplayUi {
                     @Override
                     public void onLog(String line) {
                         if (generation == replayGeneration) {
+                            if (looksLikeChildError(line)) {
+                                lastChildError = line;
+                            }
                             ReplayMainFrame.this.log(line);
                         }
                     }
@@ -3451,7 +3558,17 @@ public final class ReplayUi {
                             setParamsEnabled(true);
                             setRunningControls(false);
                             startBtn.setEnabled(startAllowed());
-                            stateLabel.setText(code == 0 ? "Exited" : "Failed (exit " + code + ")");
+                            if (stopRequestedByUser) {
+                                stateLabel.setText("Stopped");
+                            } else if (startTimedOut) {
+                                stateLabel.setText("Start timed out (child stopped)");
+                            } else if (code != 0 && terminalFailureText != null) {
+                                stateLabel.setText("Failed: " + oneLine(terminalFailureText));
+                            } else if (code != 0 && lastChildError != null) {
+                                stateLabel.setText("Failed: " + oneLine(lastChildError));
+                            } else {
+                                stateLabel.setText(exitStateText(false, code));
+                            }
                         });
                     }
                 }, generation);
@@ -3508,6 +3625,7 @@ public final class ReplayUi {
                 stopStartWatchdog();
                 log("[ui] start timed out: no READY/hello handshake within 15s");
                 stateLabel.setText("Start timed out");
+                startTimedOut = true;
                 if (replayProcess != null) {
                     replayProcess.kill();
                 }
@@ -3523,12 +3641,32 @@ public final class ReplayUi {
             }
         }
 
+        /**
+         * 把子进程的 error/warnings 写进 Log 页（每条只写一次）。
+         *
+         * <p>这些信息原本已经随 status 上报，但 UI 没解析：注入自检失败、参数被忽略等
+         * 只能靠用户翻 stderr。这里至少让 Log 页第一屏就能看到原因。</p>
+         */
+        private void logStatusDiagnostics(UiStatus s) {
+            if (s.lastError != null && !s.lastError.isBlank()
+                    && loggedStatusWarnings.add("error|" + s.lastError)) {
+                log("[child] error: " + s.lastError);
+            }
+            for (String warning : s.warnings) {
+                if (warning != null && !warning.isBlank()
+                        && loggedStatusWarnings.add("warn|" + warning)) {
+                    log("[child] warning: " + warning);
+                }
+            }
+        }
+
         private void applyStatus(UiStatus s) {
             if (s.seq > 0 && s.seq <= lastStatusSeq) {
                 return;   // 旧快照：只应用更大的 seq
             }
             lastStatusSeq = s.seq;
             lastStatus = s;
+            logStatusDiagnostics(s);
             String extra = s.waiting ? " · waiting for a new volume" : (s.seeking ? " · seeking" : "");
             stateLabel.setText(s.state + statusMessage(s.message) + extra);
             if (!seekPreviewActive()) {
@@ -3605,6 +3743,23 @@ public final class ReplayUi {
             return "FINISHED".equals(state) || "STOPPED".equals(state) || "FAILED".equals(state);
         }
 
+        /**
+         * 子进程退出后的状态文案。
+         *
+         * <p>用户按过 Stop 时，即使子进程被 5 秒看门狗强制结束（退出码 1），也不能显示
+         * “Failed (exit 1)”——那会把一次正常停止说成重放失败，掩盖真正的错误。</p>
+         *
+         * @param userStop 用户是否按过 Stop
+         * @param code     子进程退出码
+         * @return 状态文案
+         */
+        static String exitStateText(boolean userStop, int code) {
+            if (userStop) {
+                return "Stopped";
+            }
+            return code == 0 ? "Exited" : "Failed (exit " + code + ")";
+        }
+
         /** 收起进度条，恢复 Status 列的静态文本渲染。 */
         private void clearProgress() {
             if (!progressVisible) {
@@ -3663,6 +3818,34 @@ public final class ReplayUi {
                 log("[control] command failed: "
                         + (err == null ? json : err.getString("message")));
             }
+        }
+
+        /**
+         * @param line 子进程 stderr 的一行
+         * @return 是否像一条错误/异常（用于在子进程没发终态就退出时解释 exit code）
+         */
+        private static boolean looksLikeChildError(String line) {
+            if (line == null || line.isBlank()) {
+                return false;
+            }
+            String text = line.strip();
+            return text.startsWith("Error:")
+                    || text.contains(" ERROR ")
+                    || text.contains("FATAL")
+                    || text.contains("Exception");
+        }
+
+        /**
+         * 把子进程的错误压成一行，供状态标签显示。
+         *
+         * <p>失败原因可能是多行堆栈/中英混排：状态栏只放第一行并截断，完整内容仍在 Log 页。</p>
+         */
+        static String oneLine(String message) {
+            if (message == null) {
+                return "";
+            }
+            String first = message.strip().split("\\R", 2)[0].strip();
+            return first.length() <= 100 ? first : first.substring(0, 97) + "...";
         }
 
         /**
@@ -3858,6 +4041,7 @@ public final class ReplayUi {
             if (replayProcess == null) {
                 return;
             }
+            stopRequestedByUser = true;
             stateLabel.setText("Stopping…");
             pauseBtn.setEnabled(false);
             stopBtn.setEnabled(false);
@@ -4189,6 +4373,10 @@ public final class ReplayUi {
         long examined;
         long sent;
         long bytes;
+        /** 子进程上报的非致命告警（例如注入自检失败、参数被忽略）。 */
+        java.util.List<String> warnings = java.util.List.of();
+        /** 最近一次 error 快照的 message；null 表示没有错误。 */
+        String lastError;
 
         static UiStatus from(JSONObject json) {
             UiStatus s = new UiStatus();
@@ -4226,6 +4414,21 @@ public final class ReplayUi {
             JSONObject timing = json.getJSONObject("timing");
             if (timing != null) {
                 s.etaMs = longOrNull(timing, "etaMs");
+            }
+            com.alibaba.fastjson2.JSONArray warnings = json.getJSONArray("warnings");
+            if (warnings != null && !warnings.isEmpty()) {
+                java.util.List<String> messages = new java.util.ArrayList<>();
+                for (int i = 0; i < warnings.size(); i++) {
+                    JSONObject w = warnings.getJSONObject(i);
+                    if (w != null) {
+                        messages.add(w.getString("message"));
+                    }
+                }
+                s.warnings = messages;
+            }
+            JSONObject lastError = json.getJSONObject("lastError");
+            if (lastError != null) {
+                s.lastError = lastError.getString("message");
             }
             return s;
         }

@@ -2,14 +2,18 @@ package com.jshark.forwarder;
 
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.*;
-import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.epoll.EpollDatagramChannel;
+import io.netty.channel.group.ChannelGroup;
+import io.netty.channel.group.DefaultChannelGroup;
+import io.netty.channel.kqueue.KQueueDatagramChannel;
 import io.netty.channel.socket.DatagramPacket;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioDatagramChannel;
-import io.netty.channel.socket.nio.NioServerSocketChannel;
-import io.netty.channel.socket.nio.NioSocketChannel;
+import io.netty.handler.codec.ByteToMessageDecoder;
+import io.netty.util.concurrent.GlobalEventExecutor;
 import org.slf4j.Logger;
 
 import java.net.InetAddress;
@@ -21,7 +25,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 
 /**
  * UDP 组播桥接节点
@@ -58,9 +62,20 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
     private final List<PeerConfig> peers;
 
     // ========== Netty 线程模型 ==========
-    private final EventLoopGroup bossGroup = new NioEventLoopGroup(1);
-    private final EventLoopGroup workerGroup = new NioEventLoopGroup();
-    private final EventLoopGroup udpGroup = new NioEventLoopGroup();
+    /**
+     * 所有 channel 共用同一个事件循环组。
+     *
+     * <p>以前 UDP listener、TCP server、peer 连接各用一个 {@code NioEventLoopGroup}（默认
+     * {@code 2 × CPU} 个线程），但每个 UDP 包都要从 UDP 线程 {@code write} 到 peer 所在的
+     * TCP 线程：跨线程任务队列 + 唤醒是热路径上最大的固定开销。默认只用 1 个线程，
+     * 让 UDP 读、TCP 写、UDP 写都在同一线程内联完成；需要多核时可用
+     * {@code -Djshark.forwarder.eventLoops=N} 调大（会重新引入跨线程 handoff）。</p>
+     */
+    private final EventLoopGroup ioGroup =
+            ForwarderTransport.newEventLoopGroup(eventLoopThreads());
+
+    /** 已接受的 TCP 连接，用于 UDP 写不出去时暂停 TCP 读（背压）。 */
+    private final ChannelGroup tcpServerChannels = new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
 
     // ========== 内部状态 ==========
     /** 本地 UDP 发送 Channel（用于将 TCP 收到的数据发到本地组播） */
@@ -72,6 +87,24 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
 
     /** 到所有远端节点的 TCP 连接（用于本地→远端方向） */
     private final ConcurrentHashMap<PeerConfig, Channel> tcpOutboundChannels = new ConcurrentHashMap<>();
+    /**
+     * 热路径用的 peer channel 快照。
+     *
+     * <p>每收到一个 UDP 包都迭代 {@code ConcurrentHashMap.entrySet()} 会分配 Entry/Iterator，
+     * 且弱一致迭代器在并发增删时开销更高。连接增删时重建一个不可变 List，热路径只做数组遍历。</p>
+     */
+    private volatile List<PeerChannel> outbound = List.of();
+    /** 一个已连接 peer 的轻量快照。 */
+    private record PeerChannel(PeerConfig peer, Channel channel) {
+    }
+
+    /**
+     * 一批 UDP read 内按 peer 聚合的待写 frame。
+     *
+     * <p>只由 UDP listener 的 event loop 填充/消费；用锁而不是并发容器，是为了让
+     * {@link #stop()} 能安全地取走并释放残留 batch（锁只在同线程内无竞争，开销可忽略）。</p>
+     */
+    private final Map<Channel, CompositeByteBuf> pendingBatches = new java.util.HashMap<>();
     /** 最近一次连接失败/断开的时间（用于重试节流） */
     private final ConcurrentHashMap<PeerConfig, Long> tcpDisconnectTime = new ConcurrentHashMap<>();
     /** 最近一次连接成功的时刻（UI 的 Since 列；断开后保留，用于区分 connecting / reconnecting） */
@@ -81,6 +114,8 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
     private static final long RECONNECT_INTERVAL_MS = 3_000;
     /** 建立 TCP 连接的超时时间（避免不可达地址把重连线程卡住几十秒） */
     private static final int CONNECT_TIMEOUT_MS = 3_000;
+    /** 写协议 magic 的超时：写不出去就别把连接标成 ready。 */
+    private static final long FRAME_MAGIC_WRITE_TIMEOUT_MS = 2_000L;
     /** Peer 管理线程的扫描间隔 */
     private static final long PEER_SWEEP_MS = 1_000;
 
@@ -103,29 +138,69 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
 
     // ========== 流量统计 ==========
 
-    /** 过去半分钟内 UDP→TCP（本地→远端）的传输字节数 */
-    private final AtomicLong udpToTcpBytes = new AtomicLong(0);
+    /**
+     * 过去半分钟内 UDP→TCP（本地→远端）的传输字节数。
+     *
+     * <p>热路径上的计数用 {@link LongAdder}：UDP 读线程和 TCP 读线程会同时更新，
+     * {@code AtomicLong} 的 CAS 在竞争时会退化成自旋；{@code LongAdder} 按线程分槽，
+     * 读侧（30s 打印 / UI 快照）再求和即可。</p>
+     */
+    private final LongAdder udpToTcpBytes = new LongAdder();
     /** 过去半分钟内 TCP→UDP（远端→本地）的传输字节数 */
-    private final AtomicLong tcpToUdpBytes = new AtomicLong(0);
+    private final LongAdder tcpToUdpBytes = new LongAdder();
     /** 过去半分钟内 UDP→TCP（本地→远端）的传输包数 */
-    private final AtomicLong udpToTcpPackets = new AtomicLong(0);
+    private final LongAdder udpToTcpPackets = new LongAdder();
     /** 过去半分钟内 TCP→UDP（远端→本地）的传输包数 */
-    private final AtomicLong tcpToUdpPackets = new AtomicLong(0);
+    private final LongAdder tcpToUdpPackets = new LongAdder();
 
     // ========== 累计统计（UI / --control stdio；不随 30s 打印重置） ==========
 
-    private final AtomicLong totalUdpToTcpBytes = new AtomicLong(0);
-    private final AtomicLong totalTcpToUdpBytes = new AtomicLong(0);
-    private final AtomicLong totalUdpToTcpPackets = new AtomicLong(0);
-    private final AtomicLong totalTcpToUdpPackets = new AtomicLong(0);
-    private final AtomicLong droppedNotReady = new AtomicLong(0);
+    private final LongAdder totalUdpToTcpBytes = new LongAdder();
+    private final LongAdder totalTcpToUdpBytes = new LongAdder();
+    private final LongAdder totalUdpToTcpPackets = new LongAdder();
+    private final LongAdder totalTcpToUdpPackets = new LongAdder();
+    private final LongAdder droppedNotReady = new LongAdder();
+    /** 对端 TCP 写缓冲积压（{@code !ch.isWritable()}）时丢弃的包数：UDP 语义下宁可丢也不无限排队。 */
+    private final LongAdder droppedBackpressure = new LongAdder();
+    /** 超过 UDP 单包上限、无法装进 2 字节长度字段的包（正常 UDP 不会出现）。 */
+    private final LongAdder droppedOversize = new LongAdder();
     /** 本地 UDP 入包（含未就绪被丢弃的），用于计算本地丢弃率。 */
-    private final AtomicLong udpIngressPackets = new AtomicLong(0);
+    private final LongAdder udpIngressPackets = new LongAdder();
 
     /** UDP 收/发 socket 缓冲区（大流量灌包时避免突发丢包）。 */
-    private static final int UDP_SOCKET_BUFFER_BYTES = 4 * 1024 * 1024;
+    private static final int UDP_SOCKET_BUFFER_BYTES = 8 * 1024 * 1024;
+    /** TCP socket 缓冲区：高吞吐下让内核多缓冲一点，减少写阻塞/窗口更新频率。 */
+    private static final int TCP_SOCKET_BUFFER_BYTES = 1024 * 1024;
+    /** TCP 写缓冲水位：超过 high 认为对端跟不上，UDP→TCP 方向开始丢包而不是无限排队。 */
+    private static final WriteBufferWaterMark TCP_WRITE_WATERMARK =
+            new WriteBufferWaterMark(64 * 1024, 256 * 1024);
+    /**
+     * 单批 TCP 聚合写上限：同一批 UDP read 的 frame 合并到这么多字节就提前写出，
+     * 避免一次大突发把延迟拖到 readComplete 之后。
+     */
+    private static final int TCP_BATCH_MAX_BYTES = 64 * 1024;
+    /**
+     * 单批最多合并的 frame 数。每帧 = 头 + 载荷两个 component；限制 frame 数可避免
+     * {@code CompositeByteBuf} 组件过多触发内部合并拷贝。
+     */
+    private static final int TCP_BATCH_MAX_FRAMES = 32;
+    /** TCP accept backlog。 */
+    private static final int TCP_BACKLOG = 128;
     /** TCP→UDP 重新切分的最大 UDP 载荷，避免超过 65507 上限和 IP 分片。 */
     private static final int UDP_CHUNK_BYTES = 8 * 1024;
+
+    /**
+     * I/O 线程数。
+     *
+     * <p>默认 1：UDP 读、peer TCP 写、本地 UDP 写都在同一线程内联执行，没有跨线程 handoff。
+     * 需要多核时可用 {@code -Djshark.forwarder.eventLoops=N} 调大。</p>
+     *
+     * @return 大于 0 的线程数
+     */
+    private static int eventLoopThreads() {
+        int threads = Integer.getInteger("jshark.forwarder.eventLoops", 1);
+        return Math.max(1, threads);
+    }
 
     /** 统计信息打印线程 */
     private Thread statsThread;
@@ -203,6 +278,8 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
      */
     public void start() throws InterruptedException, java.net.SocketException {
         logger.info("[BRIDGE] Starting UDP bridge node...");
+        logger.info("[BRIDGE] I/O transport: {}, event loop threads: {}",
+                ForwarderTransport.description(), eventLoopThreads());
         logger.info("[BRIDGE] Local UDP multicast: {}:{}", localUdpHost, localUdpPort);
         logger.info("[BRIDGE] Local listen port: {}", listenPort == 0 ? "auto" : listenPort);
         logger.info("[BRIDGE] Peers: {}", peers);
@@ -261,10 +338,19 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
         }
 
         Bootstrap udpBootstrap = new Bootstrap();
-        udpBootstrap.group(udpGroup)
-                .channel(NioDatagramChannel.class)
+        udpBootstrap.group(ioGroup)
+                .channel(ForwarderTransport.datagramChannelClass())
                 .option(ChannelOption.SO_SNDBUF, UDP_SOCKET_BUFFER_BYTES)
-                .handler(new ChannelInboundHandlerAdapter());
+                .option(ChannelOption.WRITE_BUFFER_WATER_MARK, TCP_WRITE_WATERMARK)
+                .handler(new ChannelInboundHandlerAdapter() {
+                    @Override
+                    public void channelWritabilityChanged(ChannelHandlerContext ctx) {
+                        // UDP 发送通道积压时暂停所有 TCP 连接的读取，把背压传回远端；
+                        // 恢复可写后再打开 autoRead（setAutoRead(true) 会自动触发一次 read）。
+                        applyTcpReadBackpressure(ctx.channel().isWritable());
+                        ctx.fireChannelWritabilityChanged();
+                    }
+                });
 
         localUdpChannel = udpBootstrap.bind(0).sync().channel();
 
@@ -278,60 +364,25 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
     private void startTcpServer() throws InterruptedException {
         // 启动 TCP 服务端
         io.netty.bootstrap.ServerBootstrap tcpBootstrap = new io.netty.bootstrap.ServerBootstrap();
-        tcpBootstrap.group(bossGroup, workerGroup)
-                .channel(NioServerSocketChannel.class)
+        tcpBootstrap.group(ioGroup)
+                .channel(ForwarderTransport.serverChannelClass())
                 // Windows 上重启时，已关闭连接会以同一个本地端口进入 TIME_WAIT；
                 // 不开 SO_REUSEADDR 会出现 “Address already in use”。
                 .option(ChannelOption.SO_REUSEADDR, true)
+                .option(ChannelOption.SO_BACKLOG, TCP_BACKLOG)
+                .childOption(ChannelOption.TCP_NODELAY, true)
+                .childOption(ChannelOption.SO_RCVBUF, TCP_SOCKET_BUFFER_BYTES)
+                .childOption(ChannelOption.SO_SNDBUF, TCP_SOCKET_BUFFER_BYTES)
+                .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK, TCP_WRITE_WATERMARK)
                 .childHandler(new ChannelInitializer<SocketChannel>() {
                     @Override
                     protected void initChannel(SocketChannel ch) {
-                        ch.pipeline().addLast(new SimpleChannelInboundHandler<ByteBuf>() {
-                            @Override
-                            protected void channelRead0(ChannelHandlerContext ctx, ByteBuf msg) {
-                                // 从远端 TCP 收到数据 → 转发到本地 UDP 组播
-                                if (paused) {
-                                    return;
-                                }
-                                int readable = msg.readableBytes();
-                                if (readable == 0) {
-                                    return;
-                                }
-
-                                if (logger.isTraceEnabled()) {
-                                    logger.trace("[BRIDGE] TCP→UDP: forwarding {} bytes to local multicast", readable);
-                                }
-
-                                // TCP 是字节流：一次 read 可能几十 KB，直接塞进一个 UDP 包会超过
-                                // 65507 上限（message too long），也会触发 IP 分片。按固定大小切分。
-                                int chunks = (readable + UDP_CHUNK_BYTES - 1) / UDP_CHUNK_BYTES;
-                                int index = msg.readerIndex();
-                                for (int off = 0; off < readable; off += UDP_CHUNK_BYTES) {
-                                    int len = Math.min(UDP_CHUNK_BYTES, readable - off);
-                                    // 零拷贝切片；msg 由 handler 释放后，切片的引用计数仍在。
-                                    ByteBuf slice = msg.retainedSlice(index + off, len);
-                                    try {
-                                        localUdpChannel.write(new DatagramPacket(slice, localUdpTarget));
-                                    } catch (Exception e) {
-                                        slice.release();
-                                        logger.error("[BRIDGE] Failed to send UDP chunk: {}", e.getMessage());
-                                    }
-                                }
-                                localUdpChannel.flush();
-
-                                // 统计 TCP→UDP 方向的流量（远端→本地）
-                                tcpToUdpBytes.addAndGet(readable);
-                                tcpToUdpPackets.addAndGet(chunks);
-                                totalTcpToUdpBytes.addAndGet(readable);
-                                totalTcpToUdpPackets.addAndGet(chunks);
-                            }
-
-
-                            @Override
-                            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
-                                logger.error("[BRIDGE] TCP server handler error: {}", cause.getMessage());
-                            }
-                        });
+                        tcpServerChannels.add(ch);
+                        // 如果本地 UDP 发送通道此刻已经积压，新连接也不要急着读。
+                        if (localUdpChannel != null && !localUdpChannel.isWritable()) {
+                            ch.config().setAutoRead(false);
+                        }
+                        ch.pipeline().addLast(new FrameToUdpHandler());
                     }
                 });
 
@@ -347,6 +398,154 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
     }
 
     // ========== Peer 连接管理 ==========
+
+    /**
+     * TCP→UDP 的入站解码：先识别对端是否带 datagram magic，再按对应格式还原 UDP 包。
+     *
+     * <ul>
+     *   <li><b>datagram</b>：magic 之后是 {@code [2B 长度][载荷]}，每个 frame 一个 UDP 包；</li>
+     *   <li><b>stream</b>：magic 不匹配就是旧/连续流对端，按原来的 8 KiB 切片逻辑处理。</li>
+     * </ul>
+     *
+     * <p>服务端无需配置就能同时服务新旧客户端：新客户端固定发 datagram，旧/连续流客户端
+     * 不带 magic，自动走 stream。只有“新客户端 → 旧服务端”不兼容，两端同步升级即可。</p>
+     */
+    private final class FrameToUdpHandler extends ByteToMessageDecoder {
+
+        private enum InboundMode { DETECT, DATAGRAM, STREAM }
+
+        private InboundMode mode = InboundMode.DETECT;
+        private boolean pendingFlush;
+
+        @Override
+        protected void decode(ChannelHandlerContext ctx, ByteBuf in, java.util.List<Object> out) {
+            if (paused) {
+                in.skipBytes(in.readableBytes());
+                return;
+            }
+
+            if (mode == InboundMode.DETECT) {
+                int available = in.readableBytes();
+                int compare = Math.min(available, ForwarderFraming.MAGIC.length);
+                for (int i = 0; i < compare; i++) {
+                    if (in.getByte(in.readerIndex() + i) != ForwarderFraming.MAGIC[i]) {
+                        mode = InboundMode.STREAM;
+                        break;
+                    }
+                }
+                if (mode == InboundMode.DETECT) {
+                    if (available < ForwarderFraming.MAGIC.length) {
+                        return;   // 还看不出是 magic 还是碰巧同前缀的流数据
+                    }
+                    in.skipBytes(ForwarderFraming.MAGIC.length);
+                    mode = InboundMode.DATAGRAM;
+                    logger.debug("[BRIDGE] inbound framing: datagram");
+                } else {
+                    logger.debug("[BRIDGE] inbound framing: stream");
+                }
+            }
+
+            if (mode == InboundMode.STREAM) {
+                drainStream(in);
+            } else {
+                drainDatagrams(ctx, in);
+            }
+        }
+
+        /** 旧行为：TCP 字节流按 8 KiB 切片发 UDP。 */
+        private void drainStream(ByteBuf in) {
+            int readable = in.readableBytes();
+            if (readable == 0) {
+                return;
+            }
+            int chunks = (readable + UDP_CHUNK_BYTES - 1) / UDP_CHUNK_BYTES;
+            for (int off = 0; off < readable; off += UDP_CHUNK_BYTES) {
+                int len = Math.min(UDP_CHUNK_BYTES, readable - off);
+                sendUdp(in.readRetainedSlice(len));
+            }
+            tcpToUdpBytes.add(readable);
+            tcpToUdpPackets.add(chunks);
+            totalTcpToUdpBytes.add(readable);
+            totalTcpToUdpPackets.add(chunks);
+        }
+
+        /** datagram 格式：每个长度前缀 frame 还原成一个 UDP 包。 */
+        private void drainDatagrams(ChannelHandlerContext ctx, ByteBuf in) {
+            while (in.readableBytes() >= 2) {
+                int length = in.getUnsignedShort(in.readerIndex());
+                if (length > ForwarderFraming.MAX_UDP_PAYLOAD) {
+                    logger.error("[BRIDGE] Invalid datagram frame length {} (max {}); closing {}",
+                            length, ForwarderFraming.MAX_UDP_PAYLOAD, ctx.channel().remoteAddress());
+                    ctx.close();
+                    return;
+                }
+                if (in.readableBytes() < 2 + length) {
+                    return;   // 半帧，等下一次 read
+                }
+                in.skipBytes(2);
+                ByteBuf payload = in.readRetainedSlice(length);
+                sendUdp(payload);
+                tcpToUdpBytes.add(length);
+                tcpToUdpPackets.increment();
+                totalTcpToUdpBytes.add(length);
+                totalTcpToUdpPackets.increment();
+            }
+        }
+
+        private void sendUdp(ByteBuf payload) {
+            if (localUdpChannel == null || !localUdpChannel.isActive()) {
+                payload.release();
+                return;
+            }
+            try {
+                localUdpChannel.write(new DatagramPacket(payload, localUdpTarget));
+                pendingFlush = true;
+            } catch (Exception e) {
+                payload.release();
+                logger.error("[BRIDGE] Failed to send UDP: {}", e.getMessage());
+            }
+        }
+
+        @Override
+        public void channelReadComplete(ChannelHandlerContext ctx) {
+            flushUdp();
+            ctx.fireChannelReadComplete();
+        }
+        @Override
+        public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+            flushUdp();
+            super.channelInactive(ctx);
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
+            logger.error("[BRIDGE] TCP server handler error: {}", cause.getMessage());
+            ctx.close();
+        }
+
+        private void flushUdp() {
+            if (pendingFlush && localUdpChannel != null) {
+                pendingFlush = false;
+                localUdpChannel.flush();
+            }
+        }
+    }
+
+    /**
+     * TCP→UDP 方向的背压：本地 UDP 发送通道积压时暂停所有 TCP 连接的读取。
+     *
+     * <p>UDP 发送是“尽力而为”的，但 TCP 是可靠字节流：直接丢分片会永久破坏对端的流；
+     * 暂停 autoRead 让 TCP 窗口把压力传回远端，等 UDP 通道可写后自动恢复读取。</p>
+     *
+     * @param writable 本地 UDP 通道是否可写
+     */
+    private void applyTcpReadBackpressure(boolean writable) {
+        for (Channel channel : tcpServerChannels) {
+            if (channel.config().isAutoRead() != writable) {
+                channel.config().setAutoRead(writable);
+            }
+        }
+    }
 
     /**
      * 常驻 Peer 管理线程：每秒扫描一次，对未连接的 Peer 按固定间隔重试，直到 stop。
@@ -435,10 +634,10 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
                 if (!running) break;
 
                 // 获取并重置统计计数器
-                long udpBytes = udpToTcpBytes.getAndSet(0);
-                long tcpBytes = tcpToUdpBytes.getAndSet(0);
-                long udpPkts = udpToTcpPackets.getAndSet(0);
-                long tcpPkts = tcpToUdpPackets.getAndSet(0);
+                long udpBytes = udpToTcpBytes.sumThenReset();
+                long tcpBytes = tcpToUdpBytes.sumThenReset();
+                long udpPkts = udpToTcpPackets.sumThenReset();
+                long tcpPkts = tcpToUdpPackets.sumThenReset();
 
                 logger.info("[BRIDGE] === Traffic stats (last 30s) ===");
                 logger.info("[BRIDGE] UDP→TCP (local→remote): {} packets, {}",
@@ -457,10 +656,13 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
      */
     private Bootstrap createPeerBootstrap() {
         Bootstrap tcpBootstrap = new Bootstrap();
-        tcpBootstrap.group(workerGroup)
-                .channel(NioSocketChannel.class)
+        tcpBootstrap.group(ioGroup)
+                .channel(ForwarderTransport.clientChannelClass())
                 .option(ChannelOption.TCP_NODELAY, true)
                 .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT_MS)
+                .option(ChannelOption.SO_SNDBUF, TCP_SOCKET_BUFFER_BYTES)
+                .option(ChannelOption.SO_RCVBUF, TCP_SOCKET_BUFFER_BYTES)
+                .option(ChannelOption.WRITE_BUFFER_WATER_MARK, TCP_WRITE_WATERMARK)
                 .handler(new ChannelInitializer<SocketChannel>() {
                     @Override
                     protected void initChannel(SocketChannel ch) {
@@ -486,11 +688,25 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
                 logConnectFailure(peer, firstAttempt, "not active");
                 tcpDisconnectTime.put(peer, System.currentTimeMillis());
                 tcpOutboundChannels.remove(peer);
+                refreshOutbound();
+                channel.close();
+                return;
+            }
+
+            // 先把协议前缀发出去再暴露给转发线程：服务端靠它区分 datagram / legacy stream。
+            ChannelFuture magic = channel.writeAndFlush(
+                    Unpooled.wrappedBuffer(ForwarderFraming.MAGIC));
+            if (!magic.awaitUninterruptibly(FRAME_MAGIC_WRITE_TIMEOUT_MS) || !magic.isSuccess()) {
+                logConnectFailure(peer, firstAttempt, "failed to send framing magic");
+                tcpDisconnectTime.put(peer, System.currentTimeMillis());
+                tcpOutboundChannels.remove(peer);
+                refreshOutbound();
                 channel.close();
                 return;
             }
 
             tcpOutboundChannels.put(peer, channel);
+            refreshOutbound();
             tcpConnectedTime.put(peer, System.currentTimeMillis());
             tcpDisconnectTime.remove(peer);
             channel.closeFuture().addListener(cf -> onPeerClosed(peer, channel));
@@ -504,6 +720,7 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
             logConnectFailure(peer, firstAttempt, e.getMessage());
             tcpDisconnectTime.put(peer, System.currentTimeMillis());
             tcpOutboundChannels.remove(peer);
+            refreshOutbound();
         }
     }
 
@@ -521,10 +738,20 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
         if (!tcpOutboundChannels.remove(peer, channel)) {
             return; // 已被更新的连接替换
         }
+        refreshOutbound();
         tcpDisconnectTime.put(peer, System.currentTimeMillis());
         if (running) {
             logger.warn("[BRIDGE] Peer connection closed: {} (reconnecting)", peer);
         }
+    }
+
+    /** 重建热路径使用的 peer channel 快照；连接增删时调用（频率极低）。 */
+    private void refreshOutbound() {
+        List<PeerChannel> snapshot = new ArrayList<>(tcpOutboundChannels.size());
+        for (Map.Entry<PeerConfig, Channel> entry : tcpOutboundChannels.entrySet()) {
+            snapshot.add(new PeerChannel(entry.getKey(), entry.getValue()));
+        }
+        outbound = List.copyOf(snapshot);
     }
 
     // ========== 数据发送（本地 UDP → 远端 TCP） ==========
@@ -547,74 +774,197 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
     /**
      * 热路径：直接消费 Netty 的 {@link ByteBuf}，不再复制成 {@code byte[]}。
      *
-     * <p>{@code flush=false} 时只 write、不 flush，由调用方在一批 UDP 读完后统一
-     * flush（见 {@code channelReadComplete}），减少 TCP 小包和系统调用。</p>
+     * <p>{@code immediate=false} 时不立刻写 channel，而是把 frame 追加到本批 UDP 读的
+     * per-peer 缓冲；{@code channelReadComplete} 时每个 peer 只 {@code write+flush} 一次。
+     * 注意这只是把**已经读到的同批报文**合并，不会跨 read 等待，因此小流量（一批 1 个包）
+     * 的延迟与逐包写完全相同。</p>
      */
-    private void forwardToPeers(ByteBuf data, InetSocketAddress sender, boolean flush) {
-        // 暂停或 UDP→TCP 方向关闭时，不做任何发送。
-        if (paused || !udpToTcpEnabled) {
+    private void forwardToPeers(ByteBuf data, InetSocketAddress sender, boolean immediate) {
+        int length = prepareForward(data, sender);
+        if (length < 0) {
             return;
         }
 
-        // 回环过滤：如果数据来自本节点的 UDP 发送端口，则丢弃
-        if (sender.getPort() == udpSenderLocalPort) {
-            return;
-        }
-
-        int length = data.readableBytes();
-        udpIngressPackets.incrementAndGet();
-
-        // 如果节点尚未进入工作状态，丢弃数据（未就绪期间没有对端可转发）
-        if (!working.get()) {
-            droppedNotReady.incrementAndGet();
-            if (logger.isTraceEnabled()) {
-                logger.trace("[BRIDGE] Node not ready yet, dropping {} bytes from {}:{}",
-                        length, sender.getAddress(), sender.getPort());
-            }
-            return;
-        }
-
-        // 统计 UDP→TCP 方向的流量（本地→远端）
-        udpToTcpBytes.addAndGet(length);
-        udpToTcpPackets.incrementAndGet();
-        totalUdpToTcpBytes.addAndGet(length);
-        totalUdpToTcpPackets.incrementAndGet();
-
-        for (Map.Entry<PeerConfig, Channel> entry : tcpOutboundChannels.entrySet()) {
-            PeerConfig peer = entry.getKey();
-            Channel ch = entry.getValue();
-
+        for (PeerChannel entry : outbound) {
+            Channel ch = entry.channel();
             if (!ch.isActive()) {
                 // 重连交给 peer-manager；这里不能做阻塞式 connect（会卡住 UDP 事件循环）。
                 continue;
             }
+            if (!ch.isWritable()) {
+                // 写缓冲已积压（对端慢/网络拥塞）：UDP 语义下直接丢，不能无限排队吃内存。
+                droppedBackpressure.increment();
+                continue;
+            }
+            if (length > ForwarderFraming.MAX_UDP_PAYLOAD) {
+                droppedOversize.increment();
+                continue;
+            }
 
-            // 零拷贝：同一个 ByteBuf 可以被多个连接引用，各自 retain 一份。
-            ByteBuf copy = data.retainedDuplicate();
-            try {
-                if (flush) {
-                    ch.writeAndFlush(copy);
-                } else {
-                    ch.write(copy);
+            if (immediate) {
+                CompositeByteBuf frame = newFrame(ch, data, length);
+                try {
+                    ch.writeAndFlush(frame);
+                } catch (Exception e) {
+                    frame.release();
+                    onForwardFailure(entry.peer(), e);
                 }
-            } catch (Exception e) {
-                copy.release();
-                logger.error("[BRIDGE] Failed to send data to peer {}: {}", peer, e.getMessage());
-                tcpDisconnectTime.put(peer, System.currentTimeMillis());
+            } else {
+                appendToBatch(entry.peer(), ch, data, length);
             }
         }
     }
 
-    /** 把一批 UDP 读产生的 TCP 写入合并 flush。 */
-    private void flushPeerChannels() {
-        for (Channel ch : tcpOutboundChannels.values()) {
-            if (ch.isActive()) {
-                ch.flush();
+    /** 校验/计数一次本地 UDP 入包；返回载荷长度，-1 表示不转发。 */
+    private int prepareForward(ByteBuf data, InetSocketAddress sender) {
+        // 暂停或 UDP→TCP 方向关闭时，不做任何发送。
+        if (paused || !udpToTcpEnabled) {
+            return -1;
+        }
+        // 回环过滤：如果数据来自本节点的 UDP 发送端口，则丢弃
+        if (sender.getPort() == udpSenderLocalPort) {
+            return -1;
+        }
+
+        int length = data.readableBytes();
+        udpIngressPackets.increment();
+
+        // 如果节点尚未进入工作状态，丢弃数据（未就绪期间没有对端可转发）
+        if (!working.get()) {
+            droppedNotReady.increment();
+            if (logger.isTraceEnabled()) {
+                logger.trace("[BRIDGE] Node not ready yet, dropping {} bytes from {}:{}",
+                        length, sender.getAddress(), sender.getPort());
             }
+            return -1;
+        }
+
+        // 统计 UDP→TCP 方向的流量（本地→远端）
+        udpToTcpBytes.add(length);
+        udpToTcpPackets.increment();
+        totalUdpToTcpBytes.add(length);
+        totalUdpToTcpPackets.increment();
+        return length;
+    }
+
+    /** 构造 {@code [2B 长度][载荷]} 的单帧（immediate 路径用）。 */
+    private CompositeByteBuf newFrame(Channel ch, ByteBuf data, int length) {
+        CompositeByteBuf frame = ch.alloc().compositeBuffer(2);
+        frame.addComponents(true, header(ch, length), data.retainedDuplicate());
+        return frame;
+    }
+
+    /** 2 字节大端长度头。 */
+    private static ByteBuf header(Channel ch, int length) {
+        ByteBuf header = ch.alloc().buffer(2, 2);
+        header.writeShort(length);
+        return header;
+    }
+
+    /**
+     * 把一帧追加到该 peer 本批的聚合缓冲。
+     *
+     * <p>同一批 UDP read 的多个 frame 会合并成一次 channel write；达到
+     * {@link #TCP_BATCH_MAX_BYTES} 时提前写出并 flush，避免一个大突发把延迟拖长。</p>
+     */
+    private void appendToBatch(PeerConfig peer, Channel ch, ByteBuf data, int length) {
+        CompositeByteBuf full = null;
+        synchronized (pendingBatches) {
+            CompositeByteBuf batch = pendingBatches.get(ch);
+            if (batch == null) {
+                batch = ch.alloc().compositeBuffer(TCP_BATCH_MAX_FRAMES * 2);
+                pendingBatches.put(ch, batch);
+            }
+            try {
+                batch.addComponents(true, header(ch, length), data.retainedDuplicate());
+            } catch (RuntimeException e) {
+                pendingBatches.remove(ch);
+                batch.release();
+                onForwardFailure(peer, e);
+                return;
+            }
+            if (batch.readableBytes() >= TCP_BATCH_MAX_BYTES
+                    || batch.numComponents() >= TCP_BATCH_MAX_FRAMES * 2) {
+                pendingBatches.remove(ch);
+                full = batch;
+            }
+        }
+        if (full != null) {
+            writeBatch(peer, ch, full);
+        }
+    }
+
+    /** 把本批所有 peer 的聚合缓冲各写一次并 flush。 */
+    private void flushPeerBatches() {
+        if (pendingBatches.isEmpty()) {
+            return;
+        }
+        synchronized (pendingBatches) {
+            for (Map.Entry<Channel, CompositeByteBuf> entry : pendingBatches.entrySet()) {
+                Channel ch = entry.getKey();
+                CompositeByteBuf batch = entry.getValue();
+                if (!ch.isActive()) {
+                    batch.release();
+                    continue;
+                }
+                writeBatch(null, ch, batch);
+            }
+            pendingBatches.clear();
+        }
+    }
+
+    private void writeBatch(PeerConfig peer, Channel ch, CompositeByteBuf batch) {
+        try {
+            ch.write(batch);
+        } catch (Exception e) {
+            batch.release();
+            onForwardFailure(peer, e);
+            return;
+        }
+        try {
+            ch.flush();
+        } catch (Exception e) {
+            // 消息已交给 channel，不能再 release；记录即可。
+            logger.error("[BRIDGE] Failed to flush peer {}: {}",
+                    peer == null ? "?" : peer, e.getMessage());
+        }
+    }
+
+    /** 释放未写出的聚合缓冲（stop 时调用；与 UDP 线程通过锁互斥）。 */
+    private void releasePendingBatches() {
+        synchronized (pendingBatches) {
+            for (CompositeByteBuf batch : pendingBatches.values()) {
+                batch.release();
+            }
+            pendingBatches.clear();
+        }
+    }
+
+    private void onForwardFailure(PeerConfig peer, Exception e) {
+        logger.error("[BRIDGE] Failed to send data to peer {}: {}",
+                peer == null ? "?" : peer, e.getMessage());
+        if (peer != null) {
+            tcpDisconnectTime.put(peer, System.currentTimeMillis());
         }
     }
 
     // ========== UDP 组播监听 ==========
+
+    /** 加入组播组；不同 transport 的 datagram channel 没有共同的 joinGroup 接口，这里按类型分派。 */
+    private static ChannelFuture joinGroup(Channel channel, InetSocketAddress group,
+                                           NetworkInterface networkInterface) {
+        if (channel instanceof NioDatagramChannel nio) {
+            return nio.joinGroup(group, networkInterface);
+        }
+        if (channel instanceof EpollDatagramChannel epoll) {
+            return epoll.joinGroup(group, networkInterface);
+        }
+        if (channel instanceof KQueueDatagramChannel kqueue) {
+            return kqueue.joinGroup(group, networkInterface);
+        }
+        throw new IllegalArgumentException(
+                "Unsupported datagram channel for multicast: " + channel.getClass().getName());
+    }
 
     /**
      * 启动 UDP 组播监听，将收到的数据转发到所有远端节点。
@@ -625,8 +975,8 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
      */
     public void startUdpListener() throws InterruptedException {
         Bootstrap udpListenerBootstrap = new Bootstrap();
-        udpListenerBootstrap.group(udpGroup)
-                .channel(NioDatagramChannel.class)
+        udpListenerBootstrap.group(ioGroup)
+                .channel(ForwarderTransport.datagramChannelClass())
                 // 组播接收的标准做法：允许多个进程/连续重启绑定同一个组播端口。
                 .option(ChannelOption.SO_REUSEADDR, true)
                 .option(ChannelOption.SO_RCVBUF, UDP_SOCKET_BUFFER_BYTES)
@@ -640,12 +990,13 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
                         }
 
                         // 直接消费 ByteBuf（不复制成 byte[]），flush 合并到 readComplete。
+                        // 同一批 UDP read 的多个包合并成一批 TCP write，readComplete 时统一 flush。
                         forwardToPeers(packet.content(), sender, false);
                     }
 
                     @Override
                     public void channelReadComplete(ChannelHandlerContext ctx) {
-                        flushPeerChannels();
+                        flushPeerBatches();
                         ctx.fireChannelReadComplete();
                     }
                 });
@@ -663,11 +1014,9 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
                 throw new IllegalArgumentException("[BRIDGE] Cannot find network interface for CIDR: " + localMulticastIf);
             }
             try {
-                ((NioDatagramChannel) ch).joinGroup(
-                        InetAddress.getByName(localUdpHost),
-                        ni,
-                        null
-                ).sync();
+                InetSocketAddress group = new InetSocketAddress(
+                        InetAddress.getByName(localUdpHost), localUdpPort);
+                joinGroup(ch, group, ni).sync();
                 logger.info("[BRIDGE] UDP listener joined multicast group {}:{}", localUdpHost, localUdpPort);
             } catch (Exception e) {
                 throw new RuntimeException("[BRIDGE] Failed to join multicast group on interface '" + ni.getName() + "': " + e.getMessage(), e);
@@ -721,6 +1070,9 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
             statsThread.interrupt();
         }
 
+        // 释放本批尚未写出的聚合缓冲（正常由 flushPeerBatches 写出）
+        releasePendingBatches();
+
         // 关闭所有 TCP 出站连接
         for (Map.Entry<PeerConfig, Channel> entry : tcpOutboundChannels.entrySet()) {
             try {
@@ -730,6 +1082,7 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
             }
         }
         tcpOutboundChannels.clear();
+        outbound = List.of();
 
         // 关闭 TCP 服务端
         if (tcpServerChannel != null) {
@@ -738,6 +1091,12 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
             } catch (Exception e) {
                 logger.warn("[BRIDGE] Failed to close TCP server: {}", e.getMessage());
             }
+        }
+        // 关闭已接受的 TCP 连接（如果服务端 close 没有级联）
+        try {
+            tcpServerChannels.close().sync();
+        } catch (Exception e) {
+            logger.debug("[BRIDGE] Failed to close TCP server connections: {}", e.getMessage());
         }
 
         // 关闭 UDP Channel
@@ -749,11 +1108,9 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
             }
         }
 
-        // 关闭线程池。quiet period 设为 0：stop 时我们已显式关闭数据通道，
+        // 关闭事件循环。quiet period 设为 0：stop 时我们已显式关闭数据通道，
         // 不必再等默认的 2s 静默期（否则 UI 的 Stopping… 会拖 3 秒）。
-        bossGroup.shutdownGracefully(0, 2, TimeUnit.SECONDS);
-        workerGroup.shutdownGracefully(0, 2, TimeUnit.SECONDS);
-        udpGroup.shutdownGracefully(0, 2, TimeUnit.SECONDS);
+        ioGroup.shutdownGracefully(0, 2, TimeUnit.SECONDS);
 
         logger.info("[BRIDGE] UDP bridge node stopped.");
     }
@@ -800,12 +1157,12 @@ public class UdpBridgeNode implements ForwarderStatus.Source {
                     "ready".equals(state) ? tcpConnectedTime.getOrDefault(peer, 0L) : 0L));
         }
         return new ForwarderStatus.Snapshot(
-                new ForwarderStatus.Direction(totalUdpToTcpPackets.get(), totalUdpToTcpBytes.get()),
-                new ForwarderStatus.Direction(totalTcpToUdpPackets.get(), totalTcpToUdpBytes.get()),
-                droppedNotReady.get(),
+                new ForwarderStatus.Direction(totalUdpToTcpPackets.sum(), totalUdpToTcpBytes.sum()),
+                new ForwarderStatus.Direction(totalTcpToUdpPackets.sum(), totalTcpToUdpBytes.sum()),
+                droppedNotReady.sum() + droppedBackpressure.sum() + droppedOversize.sum(),
                 "0.0.0.0:" + getActualListenPort(),
                 localUdpHost + ":" + localUdpPort,
                 list,
-                udpIngressPackets.get());
+                udpIngressPackets.sum());
     }
 }
